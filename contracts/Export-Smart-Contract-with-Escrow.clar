@@ -96,6 +96,9 @@
         (try! (as-contract (stx-transfer? escrow-amount tx-sender (get seller deal))))
         (map-delete escrow-balances deal-id)
         
+        (increment-user-deals (get buyer deal))
+        (increment-user-deals (get seller deal))
+        
         (map-set trade-deals deal-id (merge deal {
             status: "COMPLETED"
         }))
@@ -221,6 +224,9 @@
             )
             (try! (as-contract (stx-transfer? escrow-amount tx-sender recipient)))
             (map-delete escrow-balances deal-id)
+            
+            (increment-user-deals (get buyer deal))
+            (increment-user-deals (get seller deal))
             
             (map-set trade-deals deal-id (merge deal {
                 status: "RESOLVED"
@@ -452,6 +458,15 @@
                 status: (if (is-eq new-completed (get total-milestones deal))
                     "COMPLETED" "ACTIVE")
             }))
+            
+            (if (is-eq new-completed (get total-milestones deal))
+                (begin
+                    (increment-user-deals (get buyer deal))
+                    (increment-user-deals (get seller deal))
+                    true
+                )
+                true
+            )
         )
         (ok true)
     )
@@ -470,4 +485,129 @@
 
 (define-read-only (get-milestone-escrow (deal-id uint))
     (ok (unwrap! (map-get? milestone-escrow deal-id) ERR-NOT-FOUND))
+)
+
+(define-constant ERR-ALREADY-RATED (err u111))
+(define-constant ERR-CANNOT-RATE-SELF (err u112))
+(define-constant ERR-INVALID-RATING (err u113))
+
+(define-map user-ratings
+    {rater: principal, rated: principal, deal-id: uint}
+    {
+        rating: uint,
+        comment: (optional (string-ascii 256)),
+        timestamp: uint
+    }
+)
+
+(define-map user-reputation
+    principal
+    {
+        total-rating: uint,
+        rating-count: uint,
+        deals-completed: uint
+    }
+)
+
+(define-map deal-ratings
+    uint
+    {
+        buyer-rated: bool,
+        seller-rated: bool,
+        avg-rating: uint
+    }
+)
+
+(define-public (rate-user
+    (deal-id uint)
+    (rated-user principal)
+    (rating uint)
+    (comment (optional (string-ascii 256)))
+)
+    (let
+        (
+            (deal (unwrap! (map-get? trade-deals deal-id) ERR-NOT-FOUND))
+            (rating-key {rater: tx-sender, rated: rated-user, deal-id: deal-id})
+            (current-reputation (default-to {total-rating: u0, rating-count: u0, deals-completed: u0} 
+                (map-get? user-reputation rated-user)))
+            (deal-rating-info (default-to {buyer-rated: false, seller-rated: false, avg-rating: u0}
+                (map-get? deal-ratings deal-id)))
+        )
+        (asserts! (or (is-eq (get status deal) "COMPLETED") (is-eq (get status deal) "RESOLVED")) ERR-WRONG-STATUS)
+        (asserts! (or (is-eq tx-sender (get buyer deal)) (is-eq tx-sender (get seller deal))) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq tx-sender rated-user)) ERR-CANNOT-RATE-SELF)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+        (asserts! (is-none (map-get? user-ratings rating-key)) ERR-ALREADY-RATED)
+        
+        (map-set user-ratings rating-key {
+            rating: rating,
+            comment: comment,
+            timestamp: stacks-block-height
+        })
+        
+        (let
+            (
+                (new-total-rating (+ (get total-rating current-reputation) rating))
+                (new-rating-count (+ (get rating-count current-reputation) u1))
+                (is-buyer-rating (is-eq tx-sender (get buyer deal)))
+                (new-buyer-rated (if is-buyer-rating true (get buyer-rated deal-rating-info)))
+                (new-seller-rated (if (not is-buyer-rating) true (get seller-rated deal-rating-info)))
+            )
+            (map-set user-reputation rated-user {
+                total-rating: new-total-rating,
+                rating-count: new-rating-count,
+                deals-completed: (get deals-completed current-reputation)
+            })
+            
+            (map-set deal-ratings deal-id {
+                buyer-rated: new-buyer-rated,
+                seller-rated: new-seller-rated,
+                avg-rating: (get avg-rating deal-rating-info)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-private (increment-user-deals (user principal))
+    (let
+        (
+            (current-reputation (default-to {total-rating: u0, rating-count: u0, deals-completed: u0}
+                (map-get? user-reputation user)))
+        )
+        (map-set user-reputation user (merge current-reputation {
+            deals-completed: (+ (get deals-completed current-reputation) u1)
+        }))
+        true
+    )
+)
+
+(define-read-only (get-user-reputation (user principal))
+    (let
+        (
+            (reputation (default-to {total-rating: u0, rating-count: u0, deals-completed: u0}
+                (map-get? user-reputation user)))
+            (avg-rating (if (> (get rating-count reputation) u0)
+                (/ (get total-rating reputation) (get rating-count reputation))
+                u0))
+        )
+        (ok {
+            average-rating: avg-rating,
+            total-ratings: (get rating-count reputation),
+            deals-completed: (get deals-completed reputation)
+        })
+    )
+)
+
+(define-read-only (get-deal-rating (deal-id uint))
+    (ok (default-to {buyer-rated: false, seller-rated: false, avg-rating: u0}
+        (map-get? deal-ratings deal-id)))
+)
+
+(define-read-only (get-rating-details
+    (rater principal)
+    (rated principal)
+    (deal-id uint)
+)
+    (ok (map-get? user-ratings {rater: rater, rated: rated, deal-id: deal-id}))
 )

@@ -611,3 +611,119 @@
 )
     (ok (map-get? user-ratings {rater: rater, rated: rated, deal-id: deal-id}))
 )
+
+(define-constant ERR-EXTENSION-NOT-FOUND (err u114))
+(define-constant ERR-EXTENSION-ALREADY-APPROVED (err u115))
+(define-constant ERR-EXTENSION-EXPIRED (err u116))
+(define-constant MAX-EXTENSION-BLOCKS u1440)
+
+(define-map deadline-extensions
+    uint
+    {
+        requester: principal,
+        new-deadline: uint,
+        reason: (string-ascii 256),
+        buyer-approved: bool,
+        seller-approved: bool,
+        request-expiry: uint,
+        status: (string-ascii 20)
+    }
+)
+
+
+(define-public (request-deadline-extension
+    (deal-id uint)
+    (new-deadline uint)
+    (reason (string-ascii 256))
+)
+    (let
+        (
+            (deal (unwrap! (map-get? trade-deals deal-id) ERR-NOT-FOUND))
+            (current-extension (map-get? deadline-extensions deal-id))
+        )
+        (asserts! (or (is-eq tx-sender (get buyer deal)) (is-eq tx-sender (get seller deal))) ERR-NOT-AUTHORIZED)
+        (asserts! (or (is-eq (get status deal) "PENDING") (is-eq (get status deal) "DELIVERED")) ERR-WRONG-STATUS)
+        (asserts! (> new-deadline (get deadline deal)) ERR-WRONG-STATUS)
+        (asserts! (<= (- new-deadline (get deadline deal)) MAX-EXTENSION-BLOCKS) ERR-WRONG-STATUS)
+        (asserts! (is-none current-extension) ERR-ALREADY-INITIALIZED)
+        
+        (let
+            (
+                (is-buyer-request (is-eq tx-sender (get buyer deal)))
+                (buyer-approved is-buyer-request)
+                (seller-approved (not is-buyer-request))
+            )
+            (map-set deadline-extensions deal-id {
+                requester: tx-sender,
+                new-deadline: new-deadline,
+                reason: reason,
+                buyer-approved: buyer-approved,
+                seller-approved: seller-approved,
+                request-expiry: (+ stacks-block-height u144),
+                status: "PENDING"
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (approve-deadline-extension (deal-id uint))
+    (let
+        (
+            (deal (unwrap! (map-get? trade-deals deal-id) ERR-NOT-FOUND))
+            (extension (unwrap! (map-get? deadline-extensions deal-id) ERR-EXTENSION-NOT-FOUND))
+        )
+        (asserts! (or (is-eq tx-sender (get buyer deal)) (is-eq tx-sender (get seller deal))) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status extension) "PENDING") ERR-WRONG-STATUS)
+        (asserts! (< stacks-block-height (get request-expiry extension)) ERR-EXTENSION-EXPIRED)
+        
+        (let
+            (
+                (is-buyer-approval (is-eq tx-sender (get buyer deal)))
+                (new-buyer-approved (if is-buyer-approval true (get buyer-approved extension)))
+                (new-seller-approved (if (not is-buyer-approval) true (get seller-approved extension)))
+                (both-approved (and new-buyer-approved new-seller-approved))
+            )
+            (asserts! (or (and is-buyer-approval (not (get buyer-approved extension)))
+                         (and (not is-buyer-approval) (not (get seller-approved extension)))) ERR-EXTENSION-ALREADY-APPROVED)
+            
+            (map-set deadline-extensions deal-id (merge extension {
+                buyer-approved: new-buyer-approved,
+                seller-approved: new-seller-approved,
+                status: (if both-approved "APPROVED" "PENDING")
+            }))
+            
+            (if both-approved
+                (begin
+                    (map-set trade-deals deal-id (merge deal {
+                        deadline: (get new-deadline extension)
+                    }))
+                    (map-delete deadline-extensions deal-id)
+                )
+                true
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (reject-deadline-extension (deal-id uint))
+    (let
+        (
+            (deal (unwrap! (map-get? trade-deals deal-id) ERR-NOT-FOUND))
+            (extension (unwrap! (map-get? deadline-extensions deal-id) ERR-EXTENSION-NOT-FOUND))
+        )
+        (asserts! (or (is-eq tx-sender (get buyer deal)) (is-eq tx-sender (get seller deal))) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status extension) "PENDING") ERR-WRONG-STATUS)
+        
+        (map-set deadline-extensions deal-id (merge extension {
+            status: "REJECTED"
+        }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-deadline-extension (deal-id uint))
+    (ok (map-get? deadline-extensions deal-id))
+)
+

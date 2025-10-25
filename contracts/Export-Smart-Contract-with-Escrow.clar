@@ -727,3 +727,63 @@
     (ok (map-get? deadline-extensions deal-id))
 )
 
+(define-constant ERR-REFUND-NOT-AVAILABLE (err u117))
+(define-constant ERR-ALREADY-REFUNDED (err u118))
+
+(define-map refund-claims
+    uint
+    {
+        claimed: bool,
+        claim-date: uint,
+        refund-amount: uint
+    }
+)
+
+(define-public (claim-refund (deal-id uint))
+    (let
+        (
+            (deal (unwrap! (map-get? trade-deals deal-id) ERR-NOT-FOUND))
+            (escrow-amount (unwrap! (map-get? escrow-balances deal-id) ERR-NOT-FOUND))
+            (refund-record (map-get? refund-claims deal-id))
+        )
+        (asserts! (is-eq (get buyer deal) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status deal) "PENDING") ERR-WRONG-STATUS)
+        (asserts! (> stacks-block-height (get deadline deal)) ERR-REFUND-NOT-AVAILABLE)
+        (asserts! (is-none refund-record) ERR-ALREADY-REFUNDED)
+        
+        (try! (as-contract (stx-transfer? escrow-amount tx-sender (get buyer deal))))
+        (map-delete escrow-balances deal-id)
+        
+        (map-set refund-claims deal-id {
+            claimed: true,
+            claim-date: stacks-block-height,
+            refund-amount: escrow-amount
+        })
+        
+        (map-set trade-deals deal-id (merge deal {
+            status: "REFUNDED"
+        }))
+        (ok escrow-amount)
+    )
+)
+
+(define-read-only (is-refund-available (deal-id uint))
+    (match (map-get? trade-deals deal-id)
+        deal 
+            (ok {
+                available: (and 
+                    (is-eq (get status deal) "PENDING")
+                    (> stacks-block-height (get deadline deal))
+                    (is-none (map-get? refund-claims deal-id))
+                ),
+                deadline: (get deadline deal),
+                current-block: stacks-block-height
+            })
+        ERR-NOT-FOUND
+    )
+)
+
+(define-read-only (get-refund-claim (deal-id uint))
+    (ok (map-get? refund-claims deal-id))
+)
+

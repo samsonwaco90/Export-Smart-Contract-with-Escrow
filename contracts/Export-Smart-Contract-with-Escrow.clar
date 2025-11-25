@@ -729,6 +729,8 @@
 
 (define-constant ERR-REFUND-NOT-AVAILABLE (err u117))
 (define-constant ERR-ALREADY-REFUNDED (err u118))
+(define-constant ERR-MILESTONE-DEADLINE-NOT-REACHED (err u119))
+(define-constant ERR-NO-FUNDS-TO-REFUND (err u120))
 
 (define-map refund-claims
     uint
@@ -736,6 +738,16 @@
         claimed: bool,
         claim-date: uint,
         refund-amount: uint
+    }
+)
+
+(define-map milestone-refund-claims
+    uint
+    {
+        claimed: bool,
+        claim-date: uint,
+        refund-amount: uint,
+        completed-count: uint
     }
 )
 
@@ -785,5 +797,73 @@
 
 (define-read-only (get-refund-claim (deal-id uint))
     (ok (map-get? refund-claims deal-id))
+)
+
+(define-public (claim-milestone-partial-refund (deal-id uint))
+    (let
+        (
+            (deal (unwrap! (map-get? milestone-deals deal-id) ERR-NOT-FOUND))
+            (escrow-amount (unwrap! (map-get? milestone-escrow deal-id) ERR-NOT-FOUND))
+            (refund-record (map-get? milestone-refund-claims deal-id))
+        )
+        (asserts! (is-eq (get buyer deal) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status deal) "ACTIVE") ERR-WRONG-STATUS)
+        (asserts! (> stacks-block-height (get deadline deal)) ERR-MILESTONE-DEADLINE-NOT-REACHED)
+        (asserts! (is-none refund-record) ERR-ALREADY-REFUNDED)
+        (asserts! (> escrow-amount u0) ERR-NO-FUNDS-TO-REFUND)
+        
+        (try! (as-contract (stx-transfer? escrow-amount tx-sender (get buyer deal))))
+        (map-delete milestone-escrow deal-id)
+        
+        (map-set milestone-refund-claims deal-id {
+            claimed: true,
+            claim-date: stacks-block-height,
+            refund-amount: escrow-amount,
+            completed-count: (get completed-milestones deal)
+        })
+        
+        (map-set milestone-deals deal-id (merge deal {
+            status: "REFUNDED"
+        }))
+        (ok escrow-amount)
+    )
+)
+
+(define-read-only (is-milestone-refund-available (deal-id uint))
+    (match (map-get? milestone-deals deal-id)
+        deal
+            (ok {
+                available: (and
+                    (is-eq (get status deal) "ACTIVE")
+                    (> stacks-block-height (get deadline deal))
+                    (is-none (map-get? milestone-refund-claims deal-id))
+                ),
+                deadline: (get deadline deal),
+                current-block: stacks-block-height,
+                uncompleted-milestones: (- (get total-milestones deal) (get completed-milestones deal))
+            })
+        ERR-NOT-FOUND
+    )
+)
+
+(define-read-only (get-milestone-refund-claim (deal-id uint))
+    (ok (map-get? milestone-refund-claims deal-id))
+)
+
+(define-read-only (calculate-milestone-refund-amount (deal-id uint))
+    (match (map-get? milestone-deals deal-id)
+        deal
+            (match (map-get? milestone-escrow deal-id)
+                escrow-balance
+                    (ok {
+                        refundable-amount: escrow-balance,
+                        total-amount: (get total-amount deal),
+                        completed-milestones: (get completed-milestones deal),
+                        total-milestones: (get total-milestones deal)
+                    })
+                ERR-NOT-FOUND
+            )
+        ERR-NOT-FOUND
+    )
 )
 
